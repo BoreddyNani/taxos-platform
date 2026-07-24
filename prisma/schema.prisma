@@ -12,23 +12,55 @@ datasource db {
   provider  = "postgresql"
   
 }
-model Document {
-  id          String           @id @default(uuid())
-  fileName    String
-  uploadedAt  DateTime         @default(now())
-  fields      ExtractedField[]
+model TaxReturn {
+  id               String           @id @default(uuid())
+  clientName       String
+  type             String
+  year             Int
+  status           String
+  urgencyScore     Int
+  assignedPreparer String
+  assignedReviewer String
+  actionOwner      String
+  blockers         String           // Stored as a JSON string for SQLite simplicity
+  fields           ExtractedField[]
+  comments         CommentThread[]
+  
 }
 
 model ExtractedField {
-  id               String   @id @default(uuid())
-  documentId       String
-  fieldKey         String
-  label            String
-  value            String
-  sourceDocSection String
-  confidence       Float
-  aiExplanation    String
-  affordance       String   @default("AI_EXTRACTED")
-  
-  document         Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  id                 String    @id @default(uuid())
+  fieldKey           String
+  label              String
+  value              String
+  sourceDocName      String
+  sourceDocPage      Int
+  sourceDocSection   String
+  calculationFormula String?
+  confidence         Float
+  aiExplanation      String
+  affordance         String
+  taxReturnId        String?
+  taxReturn          TaxReturn? @relation(fields: [taxReturnId], references: [id], onDelete: Cascade)
+  documentId         String?
+  document           Document?  @relation(fields: [documentId], references: [id], onDelete: Cascade)
+}
+
+
+model CommentThread {
+  id            String    @id @default(uuid())
+  author        String
+  role          String
+  isInternal    Boolean
+  text          String
+  timestamp     String
+  targetFieldId String?
+  taxReturnId   String
+  taxReturn     TaxReturn @relation(fields: [taxReturnId], references: [id], onDelete: Cascade)
+}
+model Document {
+  id        String           @id @default(uuid())
+  fileName  String
+  createdAt DateTime         @default(now())
+  fields    ExtractedField[]
 }

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { PrismaClient } from '../../generated/prisma';
+import { Prisma, PrismaClient } from '../../generated/prisma';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { GoogleGenAI } from '@google/genai'; // Correctly import from the unified SDK
 
@@ -10,25 +10,24 @@ const prisma = new PrismaClient({ adapter });
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    let { base64Data, mimeType, fileName = 'tax_document.pdf' } = body;
+    let { base64Data, mimeType = 'application/pdf', fileName = 'tax_document.pdf' } = body;
 
-    // Guard Checks
+    // 1. Rigorous Input Guard Checks
     if (!process.env.GEMINI_API_KEY) {
       return NextResponse.json({ error: 'GEMINI_API_KEY is not configured' }, { status: 500 });
     }
-    if (!base64Data) {
-      return NextResponse.json({ error: 'No image data provided' }, { status: 400 });
+    if (!base64Data || typeof base64Data !== 'string' || base64Data.trim() === '') {
+      return NextResponse.json({ error: 'No valid document data provided from frontend' }, { status: 400 });
     }
 
-    // 2. Strip the data URI prefix if the frontend sent it by mistake
+    // Strip the data URI prefix if present (e.g., "data:application/pdf;base64,...")
     if (base64Data.includes(',')) {
       base64Data = base64Data.split(',')[1];
     }
 
-    // 3. Initialize the Gemini Client
+    // 2. Initialize Gemini Client
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-    // 4. Define the strict JSON schema you want Gemini to extract
     const taxDataSchema = {
       type: "object",
       properties: {
@@ -41,50 +40,68 @@ export async function POST(request: Request) {
       required: ["taxpayerName", "documentType", "wages", "taxWithheld"]
     };
 
-    // 5. Call generateContent using the multimodal array input
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        {
-          inlineData: {
-            data: base64Data,
-            mimeType: mimeType
-          }
-        },
-        'You are a highly accurate tax assistant. Extract the requested fields from this document into structured JSON.'
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: taxDataSchema
-      }
-    });
+    // 3. Isolate the Gemini API call with explicit error trapping
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [
+          {
+            inlineData: {
+              data: base64Data,
+              mimeType: mimeType || 'application/pdf'
+            }
+          },
+          'You are a highly accurate tax assistant. Extract the requested fields from this document into structured JSON.'
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: taxDataSchema
+        }
+      });
+    } catch (aiError: any) {
+      console.error("Gemini Extraction Error:", aiError);
+      return NextResponse.json(
+        { error: `AI Extraction Failed: ${aiError.message || 'The document could not be processed or has no readable pages.'}` },
+        { status: 400 }
+      );
+    }
 
-    // 6. Parse the strictly generated JSON
-    const extractedData = JSON.parse(response.text || "{}");
+    const responseText = response.text || "{}";
+    const extractedData = JSON.parse(responseText);
 
-    // 7. Map Gemini's flat JSON response into the array format your Prisma model expects
+    // 4. Map fields safely with strict default values to prevent null constraint violations
     const extractedFields = Object.entries(extractedData).map(([key, value]) => ({
       fieldKey: key,
-      label: key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1').trim(), // Formats 'taxYear' to 'Tax Year'
-      value: String(value),
+      label: key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1').trim(),
+      value: value !== null && value !== undefined ? String(value) : 'N/A',
+      sourceDocName: fileName,
+      sourceDocPage: 1,
       sourceDocSection: 'Document Body',
-      confidence: 0.95, 
-      aiExplanation: 'Extracted securely via Gemini Structured Output'
+      confidence: 0.95,
+      aiExplanation: 'Extracted securely via Gemini Structured Output',
+      affordance: 'AI_EXTRACTED'
     }));
 
-    // 8. Save directly to Postgres via Prisma
+    if (extractedFields.length === 0) {
+      return NextResponse.json({ error: 'No fields could be extracted from the document.' }, { status: 400 });
+    }
+
+    // 5. Save securely to PostgreSQL via Prisma
     const document = await prisma.document.create({
       data: {
         fileName: fileName,
         fields: {
-          create: extractedFields.map((field: any) => ({
-            fieldKey: field.fieldKey || 'unknown',
-            label: field.label || 'Unknown Field',
-            value: String(field.value || ''),
-            sourceDocSection: field.sourceDocSection || 'Unknown',
-            confidence: parseFloat(field.confidence) || 0.5,
-            aiExplanation: field.aiExplanation || 'Extracted via AI',
-            affordance: 'AI_EXTRACTED'
+          create: extractedFields.map(field => ({
+            fieldKey: field.fieldKey,
+            label: field.label,
+            value: field.value,
+            sourceDocName: field.sourceDocName,
+            sourceDocPage: field.sourceDocPage,
+            sourceDocSection: field.sourceDocSection,
+            confidence: field.confidence,
+            aiExplanation: field.aiExplanation,
+            affordance: field.affordance
           }))
         }
       },
@@ -94,7 +111,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: true, document });
 
   } catch (error: any) {
-    console.error("Extraction Error:", error);
-    return NextResponse.json({ error: error.message || "Failed to parse document" }, { status: 500 });
+    console.error("Server Route Error:", error);
+    return NextResponse.json({ error: error.message || "Failed to process document upload" }, { status: 500 });
   }
 }
